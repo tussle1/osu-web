@@ -51,6 +51,18 @@ const BeatmapParser = (() => {
     bm.sliderMultiplier = Number(bm.difficulty.SliderMultiplier || 1.4);
     bm.sliderTickRate = Number(bm.difficulty.SliderTickRate || 1);
     bm.stackLeniency = Number(bm.general.StackLeniency || 0.7);
+    // background image from Events: 0,0,"file.jpg",0,0
+    bm.background = null;
+    for (const ev of bm.events) {
+      const m = ev.match(/^0,0,"([^"]+)"/);
+      if (m) { bm.background = m[1]; break; }
+    }
+    // combo colours -> rgb arrays
+    bm.comboColours = bm.colours.map(c => {
+      const p = c.split(',').map(Number);
+      return p.length >= 3 ? { r: p[0], g: p[1], b: p[2] } : null;
+    }).filter(Boolean);
+    if (!bm.comboColours.length) bm.comboColours = [{r:237,g:46,b:126},{r:110,g:231,b:255},{r:74,g:222,b:128},{r:251,g:191,b:36}];
     // sort timing points
     bm.timingPoints.sort((a,b)=>a.time-b.time);
     bm.hitObjects.sort((a,b)=>a.time-b.time);
@@ -264,5 +276,66 @@ const BeatmapParser = (() => {
     return bm.hitObjects;
   }
 
-  return { parseOsu, timingAt, bpmAt, svAt, arToPreempt, odToWindows, csToRadius, estimateStars, sliderPath, toPlayable };
+  // Serialize a beatmap object back to .osu text (used by the editor)
+  function serializeOsu(bm) {
+    const L = [];
+    L.push('osu file format v14');
+    L.push('');
+    L.push('[General]');
+    L.push('AudioFilename: ' + (bm.audioFilename || 'audio.mp3'));
+    L.push('AudioLeadIn: 0');
+    L.push('PreviewTime: ' + (bm.previewTime || 0));
+    L.push('Countdown: 0');
+    L.push('SampleSet: Soft');
+    L.push('StackLeniency: 0.7');
+    L.push('Mode: ' + bm.mode);
+    L.push('LetterboxInBreaks: 0');
+    L.push('WidescreenStoryboard: 0');
+    L.push('');
+    L.push('[Metadata]');
+    L.push('Title:' + bm.title);
+    L.push('TitleUnicode:' + bm.title);
+    L.push('Artist:' + bm.artist);
+    L.push('ArtistUnicode:' + bm.artist);
+    L.push('Creator:' + bm.creator);
+    L.push('Version:' + bm.version);
+    L.push('Source:');
+    L.push('Tags:');
+    L.push('BeatmapID:0');
+    L.push('BeatmapSetID:-1');
+    L.push('');
+    L.push('[Difficulty]');
+    L.push('HPDrainRate:' + bm.hp);
+    L.push('CircleSize:' + bm.cs);
+    L.push('OverallDifficulty:' + bm.od);
+    L.push('ApproachRate:' + bm.ar);
+    L.push('SliderMultiplier:' + bm.sliderMultiplier);
+    L.push('SliderTickRate:' + bm.sliderTickRate);
+    L.push('');
+    L.push('[Events]');
+    if (bm.background) L.push('0,0,"' + bm.background + '",0,0');
+    L.push('');
+    L.push('[TimingPoints]');
+    (bm.timingPoints.length ? bm.timingPoints : [{time:0,beatLength:60000/(bm.bpm||120),meter:4,sampleSet:0,sampleIndex:0,volume:80,uninherited:true,effects:0}]).forEach(tp => {
+      L.push([tp.time, tp.beatLength, tp.meter||4, tp.sampleSet||0, tp.sampleIndex||0, tp.volume||80, tp.uninherited?1:0, tp.effects||0].join(','));
+    });
+    L.push('');
+    L.push('[HitObjects]');
+    [...bm.hitObjects].sort((a,b)=>a.time-b.time).forEach(o => {
+      if (o.isSlider) {
+        const pts = (o.points || [{x:o.x,y:o.y},{x:o.x+50,y:o.y}]);
+        const curve = (o.curveType || 'L') + '|' + pts.slice(1).map(p => p.x + ':' + p.y).join('|');
+        L.push([o.x, o.y, o.time, 2 + (o.newCombo?4:0), o.hitSound||0, curve, o.repeat||1, o.length||100, '0|0', '0:0', '0:0:0:0:'].join(','));
+      } else if (o.isSpinner) {
+        L.push([256, 192, o.time, 4, o.hitSound||0, o.endTime||o.time+1000, '0:0', '0:0:0:0:'].join(','));
+      } else if (o.isHold) {
+        L.push([o.x, 192, o.time, 128, o.hitSound||0, (o.endTime||o.time+500) + ':0:0:0:0:'].join(','));
+      } else {
+        L.push([o.x, o.y, o.time, 1 + (o.newCombo?4:0), o.hitSound||0, '0:0:0:0:'].join(','));
+      }
+    });
+    return L.join('\r\n') + '\r\n';
+  }
+
+  return { parseOsu, timingAt, bpmAt, svAt, arToPreempt, odToWindows, csToRadius, estimateStars, sliderPath, toPlayable, serializeOsu };
 })();

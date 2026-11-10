@@ -110,8 +110,19 @@ const BuiltinMaps = (() => {
     return bm;
   }
 
+  function fixSliderEnds(bm){
+    for (const o of bm.hitObjects) {
+      if (o.isSlider && o.endTime <= o.time) {
+        const beat = 60000/(bm.bpm||120);
+        const vel = (bm.sliderMultiplier||1.4)*100;
+        const dur = (o.length/vel)*beat*(o.repeat||1);
+        o.endTime = o.time + Math.max(200, dur);
+      }
+    }
+    return bm;
+  }
   function all(){
-    return [genOsu(), genOsuHard(), genTaiko(), genCatch(), genMania(), genMania7K()];
+    return [genOsu(), genOsuHard(), genTaiko(), genCatch(), genMania(), genMania7K()].map(fixSliderEnds);
   }
   return { all };
 })();

@@ -9,6 +9,13 @@ const GameEngine = (() => {
     return { ar, cs, od, hp };
   }
 
+  const SKINS = {
+    default: { name: 'Default', circle: '#ed2e7e', inner: '#ffffff', slider: '#ed2e7e', cursor: '#ffffff', cursorRing: '#ed2e7e', shape: 'circle' },
+    triangles: { name: 'Triangles', circle: '#06b6d4', inner: '#ffffff', slider: '#06b6d4', cursor: '#ffffff', cursorRing: '#06b6d4', shape: 'triangle' },
+    argonian: { name: 'Argonian', circle: '#22c55e', inner: '#052e16', slider: '#22c55e', cursor: '#ffffff', cursorRing: '#22c55e', shape: 'diamond' },
+    sunset: { name: 'Sunset', circle: '#f97316', inner: '#fff7ed', slider: '#f97316', cursor: '#ffffff', cursorRing: '#f97316', shape: 'circle' },
+  };
+
   class Game {
     constructor(canvas, beatmap, options={}) {
       this.canvas = canvas;
@@ -26,6 +33,15 @@ const GameEngine = (() => {
       this.windows = BeatmapParser.odToWindows(this.diff.od);
       this.radius = BeatmapParser.csToRadius(this.diff.cs);
       this.speed = modSpeed(this.mods);
+      // defensive: fix slider end times if missing (builtin/editor maps)
+      for (const o of beatmap.hitObjects) {
+        if (o.isSlider && o.endTime <= o.time) {
+          const t = BeatmapParser.timingAt(beatmap, o.time);
+          const vel = beatmap.sliderMultiplier * 100 * t.sv;
+          const dur = vel > 0 ? (o.length / vel) * t.beatLength * (o.repeat || 1) : 500;
+          o.endTime = o.time + Math.max(100, dur);
+        }
+      }
       this.playable = BeatmapParser.toPlayable(beatmap);
       // state
       this.state = 'idle'; // idle, playing, paused, finished, failed
@@ -54,6 +70,18 @@ const GameEngine = (() => {
       this.hidden = this.mods.includes('HD');
       this.flashlight = this.mods.includes('FL');
       this.relax = this.mods.includes('RX');
+      this.skin = SKINS[this.settings.skin] || SKINS.default;
+      this.followPoints = this.settings.followPoints !== false;
+      this.hitExplosions = this.settings.hitExplosions !== false;
+      this.backgroundImage = null;
+      if (options.backgroundImage) {
+        this.backgroundImage = new Image();
+        this.backgroundImage.src = options.backgroundImage;
+      }
+      this.comboColours = (beatmap.comboColours && beatmap.comboColours.length) ? beatmap.comboColours : null;
+      this.bigNoteState = new Map(); // taiko big notes: idx -> {don:bool, ka:bool}
+      this.holdState = new Map(); // mania holds: idx -> {lane, headHit, tailDone}
+      this.sliderTicks = new Map(); // slider idx -> Set of tick indices hit
       this.bindInput();
       this.resize();
     }
@@ -301,14 +329,35 @@ const GameEngine = (() => {
       if (best){
         const adt=Math.abs(bestDt);
         const kind = adt<=this.windows.w300?'300':adt<=this.windows.w100?'100':'50';
-        this.hitDone.add(bestIdx);
-        this.applyHit(kind, best);
         if (best.kind==='slider'){
-          this.sliderState.set(bestIdx, { headHit:true, progress:0, ticks:0 });
+          // slider head: record timing quality but don't judge yet — judgement happens at slider end
+          this.sliderState.set(bestIdx, { headHit:true, headKind:kind, progress:0, ticks:0, followTime:0, totalTime:0 });
+          AudioEngine.hitSound('hit');
+          this.explode(best.x, best.y, '#6ee7ff');
+        } else {
+          this.hitDone.add(bestIdx);
+          this.applyHit(kind, best);
         }
       }
     }
     updateOsu(dt){
+      // Relax / Autoplay (no replay): auto-hit perfectly
+      if ((this.relax || (this.autoplay && !this.replayEvents.length)) && this.state==='playing'){
+        for (let i=0;i<this.playable.length;i++){
+          const o=this.playable[i];
+          if (this.hitDone.has(i) || this.missDone.has(i)) continue;
+          if (o.kind==='spinner'){
+            if (this.mapTime >= o.time && !this.hitDone.has(i)){ this.hitDone.add(i); this.applyHit('300', o); }
+            continue;
+          }
+          if (o.kind==='slider'){
+            if (this.mapTime >= o.time && !this.sliderState.has(i)) this.sliderState.set(i,{headHit:true,headKind:'300',progress:1,followTime:1,totalTime:1});
+            if (this.mapTime >= o.endTime && !this.hitDone.has(i)){ this.hitDone.add(i); this.applyHit('300', o); }
+            continue;
+          }
+          if (this.mapTime >= o.time && !this.hitDone.has(i)){ this.hitDone.add(i); this.applyHit('300', o); }
+        }
+      }
       // auto-miss overdue
       for (let i=0;i<this.playable.length;i++){
         const o=this.playable[i];
@@ -324,19 +373,24 @@ const GameEngine = (() => {
             const ball=this.sliderBall(o, this.mapTime);
             const d=Math.hypot(this.cursor.x-ball.x, this.cursor.y-ball.y);
             const following = d < this.radius*1.2 || this.autoplay;
+            st.totalTime += dt;
             if (following){
+              st.followTime += dt;
               st.progress = clamp((this.mapTime - o.time)/(o.endTime - o.time), 0, 1);
-              if (Math.random()<0.1) AudioEngine.hitSound('slider');
-            } else {
-              // break combo slightly? count as miss if far for long? simplified: miss slider
-              if (this.mapTime > o.time + (o.endTime-o.time)*0.5 && !st.broken){
-                st.broken=true; this.applyHit('miss', o); this.missDone.add(i);
-              }
+              // slider ticks: tick every 1/sliderTickRate beats
+              const tickInterval = (60000/(this.bm.bpm||120)) / (this.bm.sliderTickRate||1);
+              const tickIdx = Math.floor((this.mapTime - o.time) / tickInterval);
+              if (!this.sliderTicks.has(i)) this.sliderTicks.set(i, new Set());
+              const ticks = this.sliderTicks.get(i);
+              if (!ticks.has(tickIdx) && this.mapTime < o.endTime){ ticks.add(tickIdx); AudioEngine.hitSound('slider'); this.score += 10; }
             }
             if (this.mapTime >= o.endTime && !this.missDone.has(i)){
               this.hitDone.add(i);
-              // slider complete: give 100 if followed most of way
-              if (!st.broken) this.applyHit(st.progress>0.7?'300':'100', o);
+              const ratio = st.totalTime > 0 ? st.followTime / st.totalTime : 0;
+              // judge by head timing + follow ratio
+              if (ratio > 0.8) this.applyHit(st.headKind==='300'?'300':'100', o);
+              else if (ratio > 0.4) this.applyHit('50', o);
+              else this.applyHit('miss', o);
             }
           } else if (this.mapTime > o.time + this.windows.w50){
             this.missDone.add(i); this.applyHit('miss', o);
@@ -397,17 +451,39 @@ const GameEngine = (() => {
       }
       if (best){
         if (best.isDon===isDon){
+          // big notes need both don+ka (two presses within window)
+          if (best.big){
+            let st=this.bigNoteState.get(bestIdx);
+            if (!st){ st={don:false,ka:false}; this.bigNoteState.set(bestIdx,st); }
+            if (isDon) st.don=true; else st.ka=true;
+            AudioEngine.hitSound(isDon?'don':'ka');
+            if (st.don && st.ka){
+              const adt=Math.abs(bestDt);
+              const kind=adt<=this.windows.w300?'300':adt<=this.windows.w100?'100':'50';
+              this.hitDone.add(bestIdx); this.applyHit(kind,best);
+            } else {
+              this.addJudgement('BIG!', '#fde047', 100, 192);
+            }
+            return;
+          }
           const adt=Math.abs(bestDt);
           const kind=adt<=this.windows.w300?'300':adt<=this.windows.w100?'100':'50';
           this.hitDone.add(bestIdx); this.applyHit(kind,best);
           AudioEngine.hitSound(isDon?'don':'ka');
         } else {
-          // wrong colour: count as miss? small penalty
+          // wrong colour: small penalty, no miss
           this.addJudgement('WRONG', '#fbbf24', 100, 192);
         }
       }
     }
     updateTaiko(dt){
+      if ((this.relax || (this.autoplay && !this.replayEvents.length)) && this.state==='playing'){
+        for(let i=0;i<this.playable.length;i++){
+          const o=this.playable[i];
+          if (this.hitDone.has(i)||this.missDone.has(i)) continue;
+          if (this.mapTime>=o.time){ this.hitDone.add(i); this.applyHit('300',o); }
+        }
+      }
       for(let i=0;i<this.playable.length;i++){
         const o=this.playable[i];
         if (this.hitDone.has(i)||this.missDone.has(i)) continue;
@@ -431,6 +507,8 @@ const GameEngine = (() => {
       if (this.keysDown.has('arrowright')||this.keysDown.has('d')) this.catcherX+=600*dt/1000;
       this.catcherX=clamp(this.catcherX, 30, 482);
       const catchY=330;
+      // catcher width from CS (larger CS = smaller catcher, like osu!)
+      const catchWidth = 90 - this.diff.cs*4;
       for(let i=0;i<this.playable.length;i++){
         const o=this.playable[i];
         if (this.hitDone.has(i)||this.missDone.has(i)) continue;
@@ -438,8 +516,9 @@ const GameEngine = (() => {
         const fallDur=this.preempt;
         const y = catchY - (o.time - this.mapTime)/fallDur * catchY;
         if (this.mapTime>=o.time){
+          if (this.relax || (this.autoplay && !this.replayEvents.length)){ this.hitDone.add(i); this.applyHit('300',o); continue; }
           const d=Math.abs(this.catcherX - o.x);
-          if (d<45){ this.hitDone.add(i); this.applyHit('300',o); }
+          if (d<catchWidth/2+10){ this.hitDone.add(i); this.applyHit('300',o); }
           else { this.missDone.add(i); this.applyHit('miss',o); }
         }
       }
@@ -477,9 +556,8 @@ const GameEngine = (() => {
         const adt=Math.abs(bestDt);
         const kind=adt<=this.windows.w300?'300':adt<=this.windows.w100?'100':'50';
         if (best.kind==='hold'){
-          this.sliderState.set(bestIdx,{headHit:true, lane, holding:true});
-          // head judged on release/end; store pending
-          this.hitDone.add(bestIdx);
+          // head judged now; tail judged on release/end (see updateMania)
+          this.holdState.set(bestIdx,{lane, headKind:kind, released:false});
           this.applyHit(kind,best);
         } else {
           this.hitDone.add(bestIdx); this.applyHit(kind,best);
@@ -487,12 +565,40 @@ const GameEngine = (() => {
       }
     }
     maniaRelease(lane){
-      // holds: if released early, break (simplified: no extra penalty)
+      // mark hold released early — tail will be judged as miss if released too early
+      this.holdState.forEach((st, idx)=>{
+        if (st.lane===lane && !st.released){
+          const o=this.playable[idx];
+          if (o && this.mapTime < o.endTime - this.windows.w50){
+            st.released=true;
+            // early release: break hold (counts as miss for tail, small penalty)
+            this.addJudgement('BREAK', '#fbbf24', o.x, 320);
+          }
+        }
+      });
     }
     updateMania(dt){
+      if ((this.relax || (this.autoplay && !this.replayEvents.length)) && this.state==='playing'){
+        for(let i=0;i<this.playable.length;i++){
+          const o=this.playable[i];
+          if (this.hitDone.has(i)||this.missDone.has(i)) continue;
+          if (this.mapTime>=o.time){ this.hitDone.add(i); this.applyHit('300',o); if(o.kind==='hold') this.holdState.set(i,{lane:o.lane,headKind:'300',released:false}); }
+        }
+      }
+      // holds: tail judgement when endTime reached
+      this.holdState.forEach((st, idx)=>{
+        const o=this.playable[idx];
+        if (!o || this.hitDone.has(idx)) return;
+        if (this.mapTime >= o.endTime){
+          this.hitDone.add(idx);
+          if (st.released) this.applyHit('miss', o);
+          else { this.applyHit(st.headKind||'300', o); this.score += 50; }
+        }
+      });
       for(let i=0;i<this.playable.length;i++){
         const o=this.playable[i];
         if (this.hitDone.has(i)||this.missDone.has(i)) continue;
+        if (this.holdState.has(i)) continue; // holds judged above
         if (this.mapTime>o.time+this.windows.w50){ this.missDone.add(i); this.applyHit('miss',o); }
       }
     }
@@ -501,10 +607,16 @@ const GameEngine = (() => {
     render(){
       const ctx=this.ctx, W=this.viewW, H=this.viewH;
       ctx.clearRect(0,0,W,H);
-      // background
-      const grad=ctx.createLinearGradient(0,0,0,H);
-      grad.addColorStop(0,'#0a0a14'); grad.addColorStop(1,'#141428');
-      ctx.fillStyle=grad; ctx.fillRect(0,0,W,H);
+      // background: beatmap image (dimmed) or gradient
+      if (this.backgroundImage && this.backgroundImage.complete && this.backgroundImage.naturalWidth){
+        ctx.drawImage(this.backgroundImage, 0, 0, W, H);
+        ctx.fillStyle = `rgba(0,0,0,${this.settings.bgDim ?? 0.3})`;
+        ctx.fillRect(0,0,W,H);
+      } else {
+        const grad=ctx.createLinearGradient(0,0,0,H);
+        grad.addColorStop(0,'#0a0a14'); grad.addColorStop(1,'#141428');
+        ctx.fillStyle=grad; ctx.fillRect(0,0,W,H);
+      }
       // playfield transform: scale PF to fit
       const scale=Math.min(W/PF_W, H/PF_H)*0.92;
       const ox=(W-PF_W*scale)/2, oy=(H-PF_H*scale)/2;
@@ -532,6 +644,23 @@ const GameEngine = (() => {
     }
     renderOsu(ctx){
       const now=this.mapTime;
+      // follow points (dotted lines between consecutive objects)
+      if (this.followPoints){
+        ctx.save();
+        ctx.fillStyle='rgba(255,255,255,0.35)';
+        for(let i=0;i<this.playable.length-1;i++){
+          const a=this.playable[i], b=this.playable[i+1];
+          if (a.kind==='spinner'||b.kind==='spinner') continue;
+          if (now < a.time - this.preempt || now > b.time) continue;
+          const dx=b.x-a.x, dy=b.y-a.y, dist=Math.hypot(dx,dy);
+          const steps=Math.min(8, Math.floor(dist/40));
+          for(let s=1;s<steps;s++){
+            const t=s/steps;
+            ctx.beginPath(); ctx.arc(a.x+dx*t, a.y+dy*t, 3, 0, Math.PI*2); ctx.fill();
+          }
+        }
+        ctx.restore();
+      }
       // sliders first (under circles)
       for(let i=0;i<this.playable.length;i++){
         const o=this.playable[i];
@@ -543,10 +672,19 @@ const GameEngine = (() => {
         if (alpha<=0) continue;
         const path=BeatmapParser.sliderPath(o);
         ctx.save(); ctx.globalAlpha=alpha*0.9;
-        ctx.strokeStyle='#ed2e7e'; ctx.lineWidth=this.radius*0.5; ctx.lineCap='round'; ctx.lineJoin='round';
+        ctx.strokeStyle=this.skin.slider; ctx.lineWidth=this.radius*0.5; ctx.lineCap='round'; ctx.lineJoin='round';
         ctx.beginPath();
         path.forEach((p,idx)=>{ if(idx===0)ctx.moveTo(p.x,p.y); else ctx.lineTo(p.x,p.y); });
         ctx.stroke();
+        // slider ticks
+        const tickInterval = (60000/(this.bm.bpm||120)) / (this.bm.sliderTickRate||1);
+        const tickCount = Math.floor((o.endTime-o.time)/tickInterval);
+        ctx.fillStyle='rgba(255,255,255,0.7)';
+        for(let tk=1;tk<tickCount;tk++){
+          const tp=clamp(tk/tickCount,0,1);
+          const idx=clamp(Math.floor(tp*(path.length-1)),0,path.length-1);
+          ctx.beginPath(); ctx.arc(path[idx].x,path[idx].y,3,0,Math.PI*2); ctx.fill();
+        }
         // reverse arrows
         ctx.fillStyle='#fff';
         ctx.beginPath(); ctx.arc(o.x,o.y,this.radius*0.45,0,Math.PI*2); ctx.fill();
@@ -554,8 +692,8 @@ const GameEngine = (() => {
         // ball
         if (now>=o.time && now<=o.endTime){
           const ball=this.sliderBall(o,now);
-          ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(ball.x,ball.y,this.radius*0.55,0,Math.PI*2); ctx.fill();
-          ctx.strokeStyle='#ed2e7e'; ctx.lineWidth=3; ctx.stroke();
+          ctx.fillStyle=this.skin.inner; ctx.beginPath(); ctx.arc(ball.x,ball.y,this.radius*0.55,0,Math.PI*2); ctx.fill();
+          ctx.strokeStyle=this.skin.slider; ctx.lineWidth=3; ctx.stroke();
         }
       }
       // circles + spinners
@@ -587,14 +725,46 @@ const GameEngine = (() => {
           ctx.strokeStyle='rgba(255,255,255,0.7)'; ctx.lineWidth=2;
           ctx.beginPath(); ctx.arc(o.x,o.y,r,0,Math.PI*2); ctx.stroke();
         }
-        ctx.fillStyle='#ed2e7e'; ctx.beginPath(); ctx.arc(o.x,o.y,this.radius,0,Math.PI*2); ctx.fill();
-        ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(o.x,o.y,this.radius*0.55,0,Math.PI*2); ctx.fill();
+        // combo colour (from beatmap) or skin colour
+        let fillCol=this.skin.circle;
+        if (this.comboColours){
+          const cc=this.comboColours[(i % this.comboColours.length)];
+          fillCol=`rgb(${cc.r},${cc.g},${cc.b})`;
+        }
+        if (this.skin.shape==='triangle'){
+          ctx.fillStyle=fillCol;
+          ctx.beginPath();
+          ctx.moveTo(o.x, o.y-this.radius); ctx.lineTo(o.x-this.radius*0.9, o.y+this.radius*0.7); ctx.lineTo(o.x+this.radius*0.9, o.y+this.radius*0.7); ctx.closePath(); ctx.fill();
+          ctx.fillStyle=this.skin.inner;
+          ctx.beginPath();
+          ctx.moveTo(o.x, o.y-this.radius*0.45); ctx.lineTo(o.x-this.radius*0.4, o.y+this.radius*0.3); ctx.lineTo(o.x+this.radius*0.4, o.y+this.radius*0.3); ctx.closePath(); ctx.fill();
+        } else if (this.skin.shape==='diamond'){
+          ctx.fillStyle=fillCol;
+          ctx.beginPath();
+          ctx.moveTo(o.x, o.y-this.radius); ctx.lineTo(o.x+this.radius, o.y); ctx.lineTo(o.x, o.y+this.radius); ctx.lineTo(o.x-this.radius, o.y); ctx.closePath(); ctx.fill();
+          ctx.fillStyle=this.skin.inner;
+          ctx.beginPath();
+          ctx.moveTo(o.x, o.y-this.radius*0.5); ctx.lineTo(o.x+this.radius*0.5, o.y); ctx.lineTo(o.x, o.y+this.radius*0.5); ctx.lineTo(o.x-this.radius*0.5, o.y); ctx.closePath(); ctx.fill();
+        } else {
+          ctx.fillStyle=fillCol; ctx.beginPath(); ctx.arc(o.x,o.y,this.radius,0,Math.PI*2); ctx.fill();
+          ctx.fillStyle=this.skin.inner; ctx.beginPath(); ctx.arc(o.x,o.y,this.radius*0.55,0,Math.PI*2); ctx.fill();
+        }
         ctx.restore();
+      }
+      // hit explosions
+      if (this.hitExplosions){
+        this.explosions.forEach(e=>{
+          ctx.save(); ctx.globalAlpha=clamp(e.life,0,1);
+          ctx.strokeStyle=e.color; ctx.lineWidth=3;
+          const r=(1-e.life)*40+10;
+          ctx.beginPath(); ctx.arc(e.x,e.y,r,0,Math.PI*2); ctx.stroke();
+          ctx.restore();
+        });
       }
       // cursor
       if (!this.autoplay || this.isReplay){
-        ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(this.cursor.x,this.cursor.y,6,0,Math.PI*2); ctx.fill();
-        ctx.strokeStyle='#ed2e7e'; ctx.lineWidth=2; ctx.stroke();
+        ctx.fillStyle=this.skin.cursor; ctx.beginPath(); ctx.arc(this.cursor.x,this.cursor.y,6,0,Math.PI*2); ctx.fill();
+        ctx.strokeStyle=this.skin.cursorRing; ctx.lineWidth=2; ctx.stroke();
       }
     }
     approachAlpha(hitTime){
@@ -714,13 +884,15 @@ const GameEngine = (() => {
       // progress
       ctx.fillStyle='rgba(255,255,255,0.15)'; ctx.fillRect(W-236,90,220,8);
       ctx.fillStyle='#ed2e7e'; ctx.fillRect(W-236,90,220*this.progress(),8);
-      // judgements
+      // judgements (at object positions, mapped to screen)
       ctx.textAlign='center';
+      const scale=Math.min(W/PF_W, H/PF_H)*0.92;
+      const ox=(W-PF_W*scale)/2, oy=(H-PF_H*scale)/2;
       this.judgements.forEach((j,idx)=>{
         ctx.globalAlpha=clamp(j.life,0,1);
         ctx.fillStyle=j.color; ctx.font='900 20px sans-serif';
-        // map playfield coords to screen: approximate center
-        ctx.fillText(j.text, W/2, 120+idx*22);
+        const sx=ox+j.x*scale, sy=oy+j.y*scale - 20;
+        ctx.fillText(j.text, sx, sy);
       });
       ctx.globalAlpha=1;
       // countdown
@@ -732,5 +904,5 @@ const GameEngine = (() => {
     }
   }
 
-  return { Game, PF_W, PF_H };
+  return { Game, PF_W, PF_H, SKINS };
 })();

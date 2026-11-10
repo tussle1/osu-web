@@ -13,8 +13,8 @@
   let filterMode = -1, filterQuery = '', sortBy = 'title';
 
   function loadSettings(){
-    try{ return { volume:0.8, offset:0, skin:'default', bgDim:0.3, showFPS:false, keyBindings:{}, ...JSON.parse(localStorage.getItem('osuweb_settings')||'{}') }; }
-    catch{ return { volume:0.8, offset:0, skin:'default', bgDim:0.3 }; }
+    try{ return { volume:0.8, offset:0, skin:'default', bgDim:0.3, showFPS:false, followPoints:true, hitExplosions:true, keyBindings:{}, ...JSON.parse(localStorage.getItem('osuweb_settings')||'{}') }; }
+    catch{ return { volume:0.8, offset:0, skin:'default', bgDim:0.3, followPoints:true, hitExplosions:true }; }
   }
   function saveSettings(){ localStorage.setItem('osuweb_settings', JSON.stringify(settings)); AudioEngine.setVolume(settings.volume); }
 
@@ -39,23 +39,30 @@
   async function loadImported(){
     try{
       const rows = await IDB.all();
-      importedMaps = rows.map(r=>({ bm: r.bm, audioBlob: r.audioBlob||null, audioUrl: r.audioUrl||null, id: r.id }));
+      importedMaps = rows.map(r=>({ bm: r.bm, audioBlob: r.audioBlob||null, audioUrl: r.audioUrl||null, bgBlob: r.bgBlob||null, bgUrl: r.bgUrl||null, id: r.id }));
     }catch{ importedMaps=[]; }
   }
   function allMaps(){
     const b = builtinMaps.map(bm=>({ bm, builtin:true, id: bm.id }));
-    const im = importedMaps.map(m=>({ bm: m.bm, builtin:false, id: m.id, audioBlob: m.audioBlob, audioUrl: m.audioUrl }));
+    const im = importedMaps.map(m=>({ bm: m.bm, builtin:false, id: m.id, audioBlob: m.audioBlob, audioUrl: m.audioUrl, bgBlob: m.bgBlob, bgUrl: m.bgUrl }));
     return [...b, ...im];
+  }
+  function bgObjectUrl(m){
+    if (!m) return null;
+    if (m.bgUrl) return m.bgUrl;
+    if (m.bgBlob) return URL.createObjectURL(m.bgBlob);
+    return null;
   }
   function findMap(id){ return allMaps().find(m=>m.id===id); }
 
   // ---------- Navigation ----------
   function navigate(screen){
     currentScreen=screen;
-    $$('.navbtn').forEach(b=>b.classList.toggle('active', b.dataset.nav===screen || (screen==='game'&&b.dataset.nav==='play') || (screen==='results'&&b.dataset.nav==='play')));
+    $$('.navbtn').forEach(b=>b.classList.toggle('active', b.dataset.nav===screen || (screen==='game'&&b.dataset.nav==='play') || (screen==='results'&&b.dataset.nav==='play') || (screen==='editor'&&b.dataset.nav==='editor')));
     if (screen==='menu') renderMenu();
     else if (screen==='play') renderPlay();
     else if (screen==='multiplayer') renderMultiplayer();
+    else if (screen==='editor') renderEditor();
     else if (screen==='leaderboards') renderLeaderboards();
     else if (screen==='profile') renderProfile();
     else if (screen==='settings') renderSettings();
@@ -78,6 +85,7 @@
       <div class="menu-grid">
         <div class="menu-tile" data-go="play"><h3>▶ Play</h3><p>Song select, mods, import .osu / .osz beatmaps</p></div>
         <div class="menu-tile" data-go="multiplayer"><h3>👥 Multiplayer</h3><p>Lobbies, live scores, spectator, chat</p></div>
+        <div class="menu-tile" data-go="editor"><h3>✏️ Editor</h3><p>Create & edit beatmaps, export .osu, playtest</p></div>
         <div class="menu-tile" data-go="leaderboards"><h3>🏆 Leaderboards</h3><p>Global, country & per-beatmap rankings</p></div>
         <div class="menu-tile" data-go="profile"><h3>👤 Profile</h3><p>Stats, top scores, friends, replays</p></div>
         <div class="menu-tile" data-go="settings"><h3>⚙ Settings</h3><p>Audio, offset, skins, keys, gameplay</p></div>
@@ -265,13 +273,14 @@
           imported++;
         } else if (name.endsWith('.osz')||name.endsWith('.zip')){
           const zip=await JSZip.loadAsync(file);
-          let audioBlob=null;
+          let audioBlob=null, bgBlob=null;
           const osuFiles=[];
           for (const [path, entry] of Object.entries(zip.files)){
             if (entry.dir) continue;
             const lower=path.toLowerCase();
             if (lower.endsWith('.osu')) osuFiles.push({ path, entry });
             else if (lower.endsWith('.mp3')||lower.endsWith('.ogg')||lower.endsWith('.wav')) audioBlob=await entry.async('blob');
+            else if (lower.endsWith('.jpg')||lower.endsWith('.jpeg')||lower.endsWith('.png')) bgBlob=await entry.async('blob');
           }
           if (!osuFiles.length) throw new Error('No .osu files in archive');
           for (const {entry} of osuFiles){
@@ -279,7 +288,13 @@
             const bm=BeatmapParser.parseOsu(text);
             const id='imp-'+uid();
             bm.id=id;
-            await IDB.put({ id, bm, audioBlob, audioUrl:null });
+            // match background by filename if present
+            let thisBg=bgBlob;
+            if (bm.background){
+              const bgEntry=Object.entries(zip.files).find(([p])=>p.toLowerCase().endsWith(bm.background.toLowerCase()));
+              if (bgEntry) thisBg=await bgEntry[1].async('blob');
+            }
+            await IDB.put({ id, bm, audioBlob, audioUrl:null, bgBlob:thisBg, bgUrl:null });
             imported++;
           }
         } else if (name.endsWith('.mp3')||name.endsWith('.ogg')||name.endsWith('.wav')){
@@ -347,14 +362,22 @@
     else if (m.audioUrl){ try{ await AudioEngine.loadAudioFile(m.audioUrl); }catch{} }
     // else procedural (no buffer)
     const multiplayer = lobbyState && lobbyState.started ? { lobbyId: lobbyState.id, sendScore:(s,c,a)=>Api.sendWS({type:'multi_score', lobbyId:lobbyState.id, score:s, combo:c, acc:a}) } : null;
+    let lastReplaySent = 0;
     gameInstance = new GameEngine.Game(canvas, m.bm, {
-      mods: selectedMods, settings,
+      mods: selectedMods, settings, backgroundImage: bgObjectUrl(m),
       onFinish: (res)=>{ window.__lastResults=res; window.__lastMap=m; navigate('results'); },
       onScoreUpdate: (g)=>{
         const el=$('#live-hud'); if(el) el.textContent=`Score ${fmtInt(g.score)} · ${g.combo}x · ${fmtAcc(g.accuracy())} · HP ${Math.round(g.hp)}%`;
         if (multiplayer){
           const el2=$('#mp-scores');
           if (el2 && liveScores.length) el2.innerHTML=liveScores.map(s=>`<div class="live-score"><span>${esc(s.username)}</span><span>${fmtInt(s.score)} · ${s.combo}x · ${fmtAcc(s.acc)}</span></div>`).join('');
+          // stream replay events for spectators (throttled to 1/sec)
+          const now=performance.now();
+          if (now-lastReplaySent>1000 && g.recorder && g.recorder.events.length){
+            lastReplaySent=now;
+            const recent=g.recorder.events.slice(-100);
+            Api.sendWS({type:'spectate_replay', lobbyId:lobbyState.id, events:recent, mapTime:g.mapTime});
+          }
         }
       },
       multiplayer
@@ -420,7 +443,7 @@
         cleanupGame();
         const canvas=$('#game-canvas');
         if (mm.audioBlob){ try{ await AudioEngine.loadAudioFile(mm.audioBlob);}catch{} }
-        gameInstance=new GameEngine.Game(canvas, mm.bm, { mods:['AP'], settings, replayPlayback: window.__watchReplay, onFinish:()=>navigate('results') });
+        gameInstance=new GameEngine.Game(canvas, mm.bm, { mods:['AP'], settings, backgroundImage: bgObjectUrl(mm), replayPlayback: window.__watchReplay, onFinish:()=>navigate('results') });
         await gameInstance.start();
       }, 100);
     });
@@ -438,7 +461,9 @@
       if (!Api.user){ msg.textContent='Login to submit scores.'; openAuth(); return; }
       msg.textContent='Submitting…';
       const d=await Api.submitScore({ mapId:res.mapId, mapTitle:res.mapTitle, mode:res.mode, score:res.score, maxCombo:res.maxCombo, counts:res.counts, accuracy:res.accuracy, rank:res.rank, pp:res.pp, mods:res.mods, passed:res.passed, replay:res.replayEvents });
-      msg.textContent=d.offline?('Saved locally (offline): '+d.error):'Score submitted! +'+fmtInt(res.pp)+' pp';
+      if (d.offline) msg.textContent='Saved locally (offline): '+d.error;
+      else if (d.score && d.score.verified) msg.textContent='✓ Verified! Score submitted. +'+fmtInt(res.pp)+' pp';
+      else msg.textContent='Score submitted! +'+fmtInt(res.pp)+' pp';
       status(msg.textContent);
     });
     Api.mapLB(res.mapId).then(d=>{
@@ -446,6 +471,182 @@
       if (!d.scores||!d.scores.length){ el.innerHTML='<p class="muted">No scores yet.</p>'; return; }
       el.innerHTML=`<table><tr><th>#</th><th>Player</th><th>Score</th><th>Acc</th><th>Rank</th></tr>${d.scores.slice(0,10).map((s,i)=>`<tr><td>${i+1}</td><td>${esc(s.username)}</td><td>${fmtInt(s.score)}</td><td>${fmtAcc(s.accuracy)}</td><td>${s.rank}</td></tr>`).join('')}</table>`;
     });
+  }
+
+  // ---------- EDITOR ----------
+  let editorBm = null, editorTime = 1000, editorTool = 'circle', editorSelected = -1;
+  function renderEditor(){
+    if (!editorBm) editorBm = BeatmapEditor.newMap(0);
+    const bm = editorBm;
+    screenEl.innerHTML = `
+      <h1>Editor</h1>
+      <p class="muted">Create beatmaps, place hitobjects on the canvas, playtest, export .osu, or save to your library.</p>
+      <div class="grid2">
+        <div>
+          <div class="card">
+            <h2>Metadata & Difficulty</h2>
+            <div class="grid2">
+              <div><label>Title</label><input id="ed-title" value="${esc(bm.title)}"></div>
+              <div><label>Artist</label><input id="ed-artist" value="${esc(bm.artist)}"></div>
+              <div><label>Creator</label><input id="ed-creator" value="${esc(bm.creator)}"></div>
+              <div><label>Version</label><input id="ed-version" value="${esc(bm.version)}"></div>
+            </div>
+            <label>Mode</label>
+            <select id="ed-mode">${MODES.map(m=>`<option value="${m.id}" ${bm.mode===m.id?'selected':''}>${m.name}</option>`).join('')}</select>
+            <div class="grid2" style="margin-top:8px">
+              <div><label>BPM <span id="ed-bpm-val">${bm.bpm}</span></label><input type="range" id="ed-bpm" min="60" max="240" value="${bm.bpm}"></div>
+              <div><label>AR <span id="ed-ar-val">${bm.ar}</span></label><input type="range" id="ed-ar" min="0" max="10" step="0.5" value="${bm.ar}"></div>
+              <div><label>CS <span id="ed-cs-val">${bm.cs}</span></label><input type="range" id="ed-cs" min="0" max="10" step="0.5" value="${bm.cs}"></div>
+              <div><label>OD <span id="ed-od-val">${bm.od}</span></label><input type="range" id="ed-od" min="0" max="10" step="0.5" value="${bm.od}"></div>
+              <div><label>HP <span id="ed-hp-val">${bm.hp}</span></label><input type="range" id="ed-hp" min="0" max="10" step="0.5" value="${bm.hp}"></div>
+              <div><label>Slider mult <span id="ed-sm-val">${bm.sliderMultiplier}</span></label><input type="range" id="ed-sm" min="0.4" max="3.6" step="0.1" value="${bm.sliderMultiplier}"></div>
+            </div>
+            <div class="row" style="margin-top:10px">
+              <button class="btn secondary" id="ed-generate">Generate pattern</button>
+              <button class="btn ghost" id="ed-clear">Clear objects</button>
+              <button class="btn ghost" id="ed-new">New map</button>
+            </div>
+          </div>
+          <div class="card" style="margin-top:12px">
+            <h2>Tools</h2>
+            <div class="row">
+              <button class="btn ${editorTool==='circle'?'':'secondary'}" data-tool="circle">Circle</button>
+              <button class="btn ${editorTool==='slider'?'':'secondary'}" data-tool="slider">Slider</button>
+              <button class="btn ${editorTool==='spinner'?'':'secondary'}" data-tool="spinner">Spinner</button>
+              <button class="btn ${editorTool==='delete'?'':'secondary'}" data-tool="delete">Delete</button>
+            </div>
+            <label>Time (ms)</label>
+            <div class="row"><input type="number" id="ed-time" value="${editorTime}" style="max-width:140px"><button class="btn ghost" id="ed-time-plus">+1 beat</button><button class="btn ghost" id="ed-time-minus">-1 beat</button></div>
+            <p class="muted" style="font-size:12px">Click the canvas to place objects at the current time. Use Delete tool to remove. For Taiko/Catch/Mania, click places notes/fruits in the active lane/position.</p>
+          </div>
+          <div class="card" style="margin-top:12px">
+            <h2>Actions</h2>
+            <div class="row">
+              <button class="btn" id="ed-playtest">▶ Playtest</button>
+              <button class="btn secondary" id="ed-save">Save to library</button>
+              <button class="btn ghost" id="ed-export">Export .osu</button>
+            </div>
+            <p class="muted" id="ed-status" style="font-size:13px"></p>
+          </div>
+        </div>
+        <div>
+          <div class="card">
+            <h2>Canvas <span class="muted" id="ed-count"></span></h2>
+            <div id="game-wrap"><canvas id="ed-canvas" style="display:block;width:100%;aspect-ratio:16/9;background:#0a0a12"></canvas></div>
+            <div id="ed-list" style="max-height:300px;overflow-y:auto;margin-top:10px"></div>
+          </div>
+        </div>
+      </div>`;
+    const sync = ()=>{
+      bm.title=$('#ed-title').value; bm.artist=$('#ed-artist').value; bm.creator=$('#ed-creator').value; bm.version=$('#ed-version').value;
+      bm.mode=Number($('#ed-mode').value);
+      bm.bpm=Number($('#ed-bpm').value); bm.ar=Number($('#ed-ar').value); bm.cs=Number($('#ed-cs').value); bm.od=Number($('#ed-od').value); bm.hp=Number($('#ed-hp').value); bm.sliderMultiplier=Number($('#ed-sm').value);
+      bm.timingPoints=[{time:0,beatLength:60000/bm.bpm,meter:4,sampleSet:0,sampleIndex:0,volume:80,uninherited:true,effects:0}];
+      $('#ed-bpm-val').textContent=bm.bpm; $('#ed-ar-val').textContent=bm.ar; $('#ed-cs-val').textContent=bm.cs; $('#ed-od-val').textContent=bm.od; $('#ed-hp-val').textContent=bm.hp; $('#ed-sm-val').textContent=bm.sliderMultiplier;
+      BeatmapEditor.recompute(bm);
+      drawEditor(); renderEditorList();
+    };
+    ['ed-title','ed-artist','ed-creator','ed-version','ed-mode','ed-bpm','ed-ar','ed-cs','ed-od','ed-hp','ed-sm'].forEach(id=>{
+      const el=document.getElementById(id);
+      if(el) el.addEventListener('input',sync);
+    });
+    $$('[data-tool]').forEach(b=>b.addEventListener('click',()=>{ editorTool=b.dataset.tool; renderEditor(); }));
+    $('#ed-time').addEventListener('change',e=>{ editorTime=Number(e.target.value)||0; drawEditor(); });
+    $('#ed-time-plus').addEventListener('click',()=>{ editorTime+=60000/(bm.bpm||120); $('#ed-time').value=editorTime; drawEditor(); });
+    $('#ed-time-minus').addEventListener('click',()=>{ editorTime=Math.max(0,editorTime-60000/(bm.bpm||120)); $('#ed-time').value=editorTime; drawEditor(); });
+    $('#ed-generate').addEventListener('click',()=>{ BeatmapEditor.generatePattern(bm,32); sync(); $('#ed-status').textContent='Pattern generated ('+bm.hitObjects.length+' objects, ★ '+bm.starDifficulty.toFixed(2)+')'; });
+    $('#ed-clear').addEventListener('click',()=>{ BeatmapEditor.clearObjects(bm); sync(); });
+    $('#ed-new').addEventListener('click',()=>{ editorBm=BeatmapEditor.newMap(bm.mode); renderEditor(); });
+    $('#ed-export').addEventListener('click',()=>{
+      const text=BeatmapParser.serializeOsu(bm);
+      const blob=new Blob([text],{type:'text/plain'});
+      const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=bm.artist+' - '+bm.title+' ['+bm.version+'].osu'; a.click();
+      $('#ed-status').textContent='Exported .osu';
+    });
+    $('#ed-save').addEventListener('click',async()=>{
+      BeatmapEditor.recompute(bm);
+      const id='imp-'+uid(); bm.id=id;
+      await IDB.put({ id, bm, audioBlob:null, audioUrl:null, bgBlob:null, bgUrl:null });
+      await loadImported();
+      $('#ed-status').textContent='Saved to library (Play screen)';
+      status('Beatmap saved');
+    });
+    $('#ed-playtest').addEventListener('click',async()=>{
+      BeatmapEditor.recompute(bm);
+      const id='editor-test'; bm.id=id;
+      // save temporarily to library for playtest
+      await IDB.put({ id, bm, audioBlob:null, audioUrl:null, bgBlob:null, bgUrl:null });
+      await loadImported();
+      selectedMapId=id; selectedMods=[];
+      navigate('game');
+    });
+    const canvas=$('#ed-canvas');
+    canvas.addEventListener('click',(e)=>{
+      const r=canvas.getBoundingClientRect();
+      const x=(e.clientX-r.left)/r.width*512, y=(e.clientY-r.top)/r.height*384;
+      if (editorTool==='delete'){
+        // delete nearest object within 30px
+        let best=-1,bestD=1e9;
+        bm.hitObjects.forEach((o,i)=>{ const d=Math.hypot(o.x-x,o.y-y); if(d<bestD){bestD=d;best=i;} });
+        if (best>=0 && bestD<40){ BeatmapEditor.removeObject(bm,best); sync(); }
+        return;
+      }
+      if (bm.mode===0){
+        if (editorTool==='circle') BeatmapEditor.addObject(bm,{x:Math.round(x),y:Math.round(y),time:editorTime,type:1,hitSound:0,isCircle:true,isSlider:false,isSpinner:false,isHold:false,newCombo:false,comboOffset:0,endTime:editorTime});
+        else if (editorTool==='slider') BeatmapEditor.addObject(bm,{x:Math.round(x),y:Math.round(y),time:editorTime,type:2,hitSound:0,isCircle:false,isSlider:true,isSpinner:false,isHold:false,newCombo:false,comboOffset:0,endTime:editorTime,curveType:'L',points:[{x:Math.round(x),y:Math.round(y)},{x:Math.round(clamp(x+100,0,512)),y:Math.round(y)}],repeat:1,length:120});
+        else if (editorTool==='spinner') BeatmapEditor.addObject(bm,{x:256,y:192,time:editorTime,type:4,hitSound:0,isCircle:false,isSlider:false,isSpinner:true,isHold:false,newCombo:false,comboOffset:0,endTime:editorTime+2000});
+      } else if (bm.mode===1){
+        const isDon = y<192;
+        BeatmapEditor.addObject(bm,{x:256,y:isDon?100:280,time:editorTime,type:1,hitSound:0,isCircle:true,isSlider:false,isSpinner:false,isHold:false,newCombo:false,comboOffset:0,endTime:editorTime});
+      } else if (bm.mode===2){
+        BeatmapEditor.addObject(bm,{x:Math.round(clamp(x,0,512)),y:0,time:editorTime,type:1,hitSound:0,isCircle:true,isSlider:false,isSpinner:false,isHold:false,newCombo:false,comboOffset:0,endTime:editorTime});
+      } else {
+        const keys=clamp(Math.round(bm.cs),4,10);
+        const lane=clamp(Math.floor(x/(512/keys)),0,keys-1);
+        const lx=Math.floor(lane*(512/keys)+(512/keys)/2);
+        BeatmapEditor.addObject(bm,{x:lx,y:0,time:editorTime,type:1,hitSound:0,isCircle:true,isSlider:false,isSpinner:false,isHold:false,newCombo:false,comboOffset:0,endTime:editorTime});
+      }
+      sync();
+    });
+    drawEditor(); renderEditorList();
+  }
+  function drawEditor(){
+    const canvas=$('#ed-canvas'); if(!canvas) return;
+    const ctx=canvas.getContext('2d');
+    const dpr=Math.min(2,window.devicePixelRatio||1);
+    const w=canvas.clientWidth||600, h=canvas.clientHeight||338;
+    canvas.width=w*dpr; canvas.height=h*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle='#0a0a12'; ctx.fillRect(0,0,w,h);
+    const scale=Math.min(w/512,h/384)*0.92, ox=(w-512*scale)/2, oy=(h-384*scale)/2;
+    ctx.save(); ctx.translate(ox,oy); ctx.scale(scale,scale);
+    ctx.fillStyle='rgba(255,255,255,0.04)'; ctx.fillRect(0,0,512,384);
+    ctx.strokeStyle='rgba(255,255,255,0.12)'; ctx.strokeRect(0,0,512,384);
+    const bm=editorBm; if(!bm){ ctx.restore(); return; }
+    const radius=BeatmapParser.csToRadius(bm.cs);
+    bm.hitObjects.forEach((o,i)=>{
+      const sel=i===editorSelected;
+      if (o.isSlider){
+        const path=BeatmapParser.sliderPath(o);
+        ctx.strokeStyle=sel?'#fde047':'#ed2e7e'; ctx.lineWidth=radius*0.5;
+        ctx.beginPath(); path.forEach((p,idx)=>{ if(idx===0)ctx.moveTo(p.x,p.y); else ctx.lineTo(p.x,p.y); }); ctx.stroke();
+        ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(o.x,o.y,radius*0.5,0,Math.PI*2); ctx.fill();
+      } else if (o.isSpinner){
+        ctx.strokeStyle=sel?'#fde047':'#6ee7ff'; ctx.lineWidth=6; ctx.beginPath(); ctx.arc(256,192,80,0,Math.PI*2); ctx.stroke();
+      } else {
+        ctx.fillStyle=sel?'#fde047':'#ed2e7e'; ctx.beginPath(); ctx.arc(o.x,o.y,radius,0,Math.PI*2); ctx.fill();
+        ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(o.x,o.y,radius*0.5,0,Math.PI*2); ctx.fill();
+      }
+      ctx.fillStyle='rgba(255,255,255,0.7)'; ctx.font='10px sans-serif'; ctx.textAlign='center';
+      ctx.fillText(o.time, o.x, o.y-radius-6);
+    });
+    ctx.restore();
+    const el=$('#ed-count'); if(el) el.textContent=`(${bm.hitObjects.length} objects · ★ ${bm.starDifficulty.toFixed(2)} · ${fmtTime(bm.length)})`;
+  }
+  function renderEditorList(){
+    const el=$('#ed-list'); if(!el) return;
+    const bm=editorBm; if(!bm) return;
+    el.innerHTML=bm.hitObjects.map((o,i)=>`<div class="live-score"><span>#${i+1} ${o.isSlider?'Slider':o.isSpinner?'Spinner':o.isHold?'Hold':'Circle'} @ ${o.time}ms (${o.x},${o.y})</span><button class="btn ghost" data-del="${i}">Delete</button></div>`).join('')||'<p class="muted">No objects yet. Click canvas to place.</p>';
+    $$('[data-del]',el).forEach(b=>b.addEventListener('click',()=>{ BeatmapEditor.removeObject(bm,Number(b.dataset.del)); drawEditor(); renderEditorList(); }));
   }
 
   // ---------- MULTIPLAYER ----------
@@ -459,6 +660,8 @@
             <h2>Create lobby</h2>
             <label>Lobby name</label><input id="lobby-name" value="My Lobby">
             <label>Map</label><select id="lobby-map">${allMaps().map(m=>`<option value="${esc(m.id)}">${esc(m.bm.artist)} - ${esc(m.bm.title)} [${esc(m.bm.version)}] (${MODES[m.bm.mode].name})</option>`).join('')}</select>
+            <label>Password (optional)</label><input id="lobby-pass" placeholder="No password">
+            <label>Mods (comma-separated, e.g. DT,HD)</label><input id="lobby-mods" placeholder="DT,HD">
             <div class="row" style="margin-top:10px"><button class="btn" id="create-lobby">Create lobby</button><button class="btn ghost" id="leave-lobby">Leave</button></div>
           </div>
           <div class="card" style="margin-top:12px" id="lobby-box"><h2>Lobby</h2><p class="muted">No lobby joined. Create one or join below.</p></div>
@@ -472,7 +675,8 @@
     $('#create-lobby').addEventListener('click',()=>{
       const name=$('#lobby-name').value, mapId=$('#lobby-map').value;
       const m=findMap(mapId);
-      Api.sendWS({type:'lobby_create', name, mapId, mode: m?m.bm.mode:0});
+      const mods=$('#lobby-mods').value.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean);
+      Api.sendWS({type:'lobby_create', name, mapId, mode: m?m.bm.mode:0, password: $('#lobby-pass').value, mods});
       status('Creating lobby…');
     });
     $('#leave-lobby').addEventListener('click',()=>{ Api.sendWS({type:'lobby_leave'}); lobbyState=null; renderLobbyBox(); });
@@ -483,34 +687,67 @@
     const box=$('#lobby-box'); if(!box) return;
     if (!lobbyState){ box.innerHTML='<h2>Lobby</h2><p class="muted">No lobby joined.</p>'; return; }
     const m=findMap(lobbyState.mapId);
-    box.innerHTML=`<h2>${esc(lobbyState.name)}</h2>
-      <p class="muted">Map: ${m?esc(m.bm.artist+' - '+m.bm.title):esc(lobbyState.mapId)} · Players: ${lobbyState.playerCount} · Ready: ${lobbyState.readyCount}</p>
+    box.innerHTML=`<h2>${esc(lobbyState.name)} ${lobbyState.hasPassword?'<span class="pill">🔒</span>':''}</h2>
+      <p class="muted">Map: ${m?esc(m.bm.artist+' - '+m.bm.title):esc(lobbyState.mapId)} · Players: ${lobbyState.playerCount} · Ready: ${lobbyState.readyCount} · Mods: ${(lobbyState.mods||[]).join(' ')||'—'}</p>
       <div>${lobbyState.players.map(p=>`<div class="live-score"><span>${esc(p.username)}</span><span>${lobbyState.ready.includes(p.username)?'✓ Ready':'…'}</span></div>`).join('')}</div>
       <div class="row" style="margin-top:10px">
         <button class="btn secondary" id="ready-btn">${lobbyState.ready.includes(Api.user?Api.user.username:'')?'Unready':'Ready'}</button>
         <button class="btn" id="start-lobby">Start match</button>
         <button class="btn ghost" id="play-lobby">Play map</button>
+        <button class="btn ghost" id="spectate-lobby">Spectate</button>
       </div>`;
     const rb=$('#ready-btn'); if(rb) rb.addEventListener('click',()=>Api.sendWS({type:'lobby_ready', lobbyId:lobbyState.id, ready:!lobbyState.ready.includes(Api.user?Api.user.username:'')}));
-    const sb=$('#start-lobby'); if(sb) sb.addEventListener('click',()=>Api.sendWS({type:'lobby_start', lobbyId:lobbyState.id}));
-    const pb=$('#play-lobby'); if(pb) pb.addEventListener('click',()=>{ selectedMapId=lobbyState.mapId; navigate('game'); });
+    const sb=$('#start-lobby'); if(sb) sb.addEventListener('click',()=>Api.sendWS({type:'lobby_start', lobbyId:lobbyState.id, mods: lobbyState.mods||[]}));
+    const pb=$('#play-lobby'); if(pb) pb.addEventListener('click',()=>{ selectedMapId=lobbyState.mapId; selectedMods=lobbyState.mods||[]; navigate('game'); });
+    const sp=$('#spectate-lobby'); if(sp) sp.addEventListener('click',()=>spectateLobby(lobbyState.id, lobbyState.mapId));
+  }
+  function spectateLobby(lobbyId, mapId){
+    const m=findMap(mapId);
+    if (!m){ status('Beatmap not found for spectate'); return; }
+    selectedMapId=mapId; selectedMods=['AP'];
+    navigate('game');
+    status('Spectating lobby '+lobbyId+'…');
+    // spectate mode: game runs in autoplay; live replay events will drive cursor when available
+    setTimeout(async ()=>{
+      const mm=findMap(mapId); if(!mm) return;
+      $('#game-overlay').style.display='none';
+      cleanupGame();
+      const canvas=$('#game-canvas');
+      if (mm.audioBlob){ try{ await AudioEngine.loadAudioFile(mm.audioBlob);}catch{} }
+      gameInstance=new GameEngine.Game(canvas, mm.bm, { mods:['AP'], settings, backgroundImage: bgObjectUrl(mm), spectate:true, onFinish:()=>navigate('multiplayer') });
+      await gameInstance.start();
+    },100);
   }
   Api.onWS((msg)=>{
     if (msg.type==='lobby_list'){
       const el=$('#lobby-list'); if(!el) return;
       if (!msg.lobbies.length){ el.innerHTML='<p class="muted">No open lobbies.</p>'; return; }
-      el.innerHTML=msg.lobbies.map(l=>`<div class="lobby-row"><div style="flex:1"><b>${esc(l.name)}</b><br><span class="muted">${esc(l.mapId)} · ${l.playerCount} players ${l.started?'· <span class="pill">LIVE</span>':''}</span></div><button class="btn secondary" data-join="${l.id}">Join</button></div>`).join('');
-      $$('#lobby-list [data-join]').forEach(b=>b.addEventListener('click',()=>Api.sendWS({type:'lobby_join', lobbyId:Number(b.dataset.join)})));
+      el.innerHTML=msg.lobbies.map(l=>`<div class="lobby-row"><div style="flex:1"><b>${esc(l.name)}</b> ${l.hasPassword?'🔒':''}<br><span class="muted">${esc(l.mapId)} · ${l.playerCount} players ${l.started?'· <span class="pill">LIVE</span>':''} · ${(l.mods||[]).join(' ')||'No mods'}</span></div><button class="btn secondary" data-join="${l.id}">Join</button></div>`).join('');
+      $$('#lobby-list [data-join]').forEach(b=>b.addEventListener('click',()=>{
+        const pass=prompt('Password (leave empty if none):')||'';
+        Api.sendWS({type:'lobby_join', lobbyId:Number(b.dataset.join), password:pass});
+      }));
     } else if (msg.type==='lobby_joined' || msg.type==='lobby_update'){
       lobbyState=msg.lobby; renderLobbyBox();
     } else if (msg.type==='multi_start'){
       status('Match starting! Joining map…');
       selectedMapId=msg.mapId;
-      lobbyState={...lobbyState, started:true, id:msg.lobbyId};
+      selectedMods=msg.mods||[];
+      lobbyState={...lobbyState, started:true, id:msg.lobbyId, mods:msg.mods||[]};
       navigate('game');
     } else if (msg.type==='multi_score_update'){
       liveScores=msg.scores;
       const el=$('#live-box'); if(el) el.innerHTML=msg.scores.map(s=>`<div class="live-score"><span>${esc(s.username)}</span><span>${fmtInt(s.score)} · ${s.combo}x · ${fmtAcc(s.acc)}</span></div>`).join('');
+    } else if (msg.type==='spectate_replay_update'){
+      // live replay stream: feed events into spectating game instance
+      if (gameInstance && gameInstance.spectate){
+        gameInstance.replayEvents.push(...msg.events);
+        gameInstance.replayEvents.sort((a,b)=>a.t-b.t);
+      }
+      const el=$('#live-box');
+      if (el) el.innerHTML+=`<div class="live-score"><span>👁 ${esc(msg.username)}</span><span>${msg.events.length} events @ ${fmtTime(msg.mapTime)}</span></div>`;
+    } else if (msg.type==='error'){
+      status(msg.error);
     }
   });
 
@@ -661,8 +898,11 @@
         </div>
         <div class="card">
           <h2>Gameplay</h2>
-          <label>Skin</label><select id="skin"><option value="default">Default (pink)</option><option value="triangles">Triangles</option><option value="argonian">Argonian</option></select>
+          <label>Skin</label><select id="skin">${Object.entries(GameEngine.SKINS).map(([k,v])=>`<option value="${k}" ${settings.skin===k?'selected':''}>${v.name}</option>`).join('')}</select>
+          <div id="skin-preview" style="margin:8px 0"></div>
           <label>Background dim</label><input type="range" id="dim" min="0" max="0.8" step="0.05" value="${settings.bgDim}">
+          <label style="display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" id="follow" ${settings.followPoints?'checked':''} style="width:auto"> Follow points</label>
+          <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="explosions" ${settings.hitExplosions?'checked':''} style="width:auto"> Hit explosions</label>
           <p class="muted">Keys: osu! <span class="kbd">Z</span>/<span class="kbd">X</span> · Taiko <span class="kbd">D</span><span class="kbd">F</span><span class="kbd">J</span><span class="kbd">K</span> · Catch <span class="kbd">←</span><span class="kbd">→</span> · Mania 4K <span class="kbd">D</span><span class="kbd">F</span><span class="kbd">J</span><span class="kbd">K</span></p>
         </div>
         <div class="card">
@@ -677,8 +917,12 @@
       </div>`;
     $('#vol').addEventListener('input',e=>{ settings.volume=Number(e.target.value); $('#vol-val').textContent=settings.volume; saveSettings(); });
     $('#offset').addEventListener('change',e=>{ settings.offset=Number(e.target.value); saveSettings(); });
-    $('#skin').addEventListener('change',e=>{ settings.skin=e.target.value; saveSettings(); });
+    const skinPrev=()=>{ const s=GameEngine.SKINS[settings.skin]||GameEngine.SKINS.default; $('#skin-preview').innerHTML=`<span style="display:inline-block;width:36px;height:36px;border-radius:50%;background:${s.circle};border:3px solid ${s.inner};vertical-align:middle"></span> <span class="muted">${s.name} — ${s.shape}</span>`; };
+    $('#skin').addEventListener('change',e=>{ settings.skin=e.target.value; saveSettings(); skinPrev(); });
+    skinPrev();
     $('#dim').addEventListener('input',e=>{ settings.bgDim=Number(e.target.value); saveSettings(); });
+    $('#follow').addEventListener('change',e=>{ settings.followPoints=e.target.checked; saveSettings(); });
+    $('#explosions').addEventListener('change',e=>{ settings.hitExplosions=e.target.checked; saveSettings(); });
     const lo=$('#login2'); if(lo) lo.addEventListener('click',openAuth);
     const out=$('#logout-btn'); if(out) out.addEventListener('click',async()=>{ await Api.logout(); renderSettings(); });
     $('#clear-data').addEventListener('click',()=>{ if(confirm('Clear imported maps & replays?')){ localStorage.removeItem('osuweb_scores'); IDB.all().then(rows=>rows.forEach(r=>IDB.del(r.id))).then(()=>{ loadImported(); status('Cleared'); }); } });

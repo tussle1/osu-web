@@ -66,6 +66,7 @@ const Api = (() => {
     async removeFriend(id){ return req('DELETE','/api/friends/'+id); },
     async beatmaps(){ try{ return await req('GET','/api/beatmaps'); }catch{ return { beatmaps: [] }; } },
     async registerBeatmap(b){ try{ return await req('POST','/api/beatmaps',b); }catch{ return null; } },
+    async getReplay(scoreId){ return req('GET','/api/scores/'+scoreId+'/replay'); },
     localScores,
   };
 })();

@@ -121,3 +121,6 @@ th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.5p
 .hidden{display:none!important}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .spacer{flex:1}
+/* editor */
+#ed-canvas{cursor:crosshair}
+#ed-list .live-score{font-size:13px}

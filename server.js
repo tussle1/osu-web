@@ -164,16 +164,51 @@ app.get('/api/leaderboard/map/:mapId', (req, res) => {
   res.json({ scores: scores.map(s=>({ ...s, username: (db.users.find(u=>u.id===s.userId)||{}).username || 'Unknown' })) });
 });
 
-// ---------- Scores ----------
+// ---------- Scores (with verification) ----------
+function verifyScore(s) {
+  const errors = [];
+  const counts = s.counts || {};
+  const c300 = Number(counts['300']||0), c100 = Number(counts['100']||0), c50 = Number(counts['50']||0), miss = Number(counts.miss||0);
+  const total = c300+c100+c50+miss;
+  if (total <= 0) errors.push('No objects judged');
+  if (total > 10000) errors.push('Too many objects');
+  const acc = Number(s.accuracy||0);
+  if (acc < 0 || acc > 100) errors.push('Accuracy out of range');
+  // accuracy must match counts (within 0.5%)
+  if (total > 0) {
+    const expected = ((c300*300 + c100*100 + c50*50) / (total*300)) * 100;
+    if (Math.abs(expected - acc) > 0.6) errors.push(`Accuracy mismatch (expected ${expected.toFixed(2)}%)`);
+  }
+  if (Number(s.maxCombo||0) > total) errors.push('Max combo exceeds object count');
+  if (Number(s.score||0) < 0 || Number(s.score||0) > 100000000) errors.push('Score out of range');
+  if (Number(s.pp||0) < 0 || Number(s.pp||0) > 2000) errors.push('PP out of range');
+  if (!['XH','X','SH','S','A','B','C','D','F'].includes(String(s.rank||'F'))) errors.push('Invalid rank');
+  // rank must be consistent with accuracy/miss (basic check)
+  if (s.passed) {
+    const rank = String(s.rank||'F');
+    if (miss===0 && acc>=90 && !['XH','X','SH','S'].includes(rank)) errors.push('Rank too low for accuracy');
+    if (acc < 50 && rank !== 'F' && rank !== 'D') errors.push('Rank too high for accuracy');
+  }
+  // replay must exist for passed scores (anti-cheat: no replay = no leaderboard)
+  const replay = s.replay;
+  if (s.passed && (!replay || !Array.isArray(replay) || replay.length === 0)) {
+    // allow builtin test scores without replay? No — require replay for leaderboard eligibility
+    errors.push('Replay required for passed scores');
+  }
+  if (Array.isArray(replay) && replay.length > 200000) errors.push('Replay too large');
+  return { ok: errors.length===0, errors };
+}
 app.post('/api/scores', (req, res) => {
   const u = authUser(req);
   if (!u) return res.status(401).json({ error: 'Not logged in' });
   const s = req.body || {};
+  const v = verifyScore(s);
+  if (!v.ok) return res.status(400).json({ error: 'Score verification failed: ' + v.errors.join('; ') });
   const score = {
     id: db.nextScoreId++, userId: u.id, mapId: String(s.mapId||'builtin'), mapTitle: String(s.mapTitle||'Unknown'),
     mode: Number(s.mode||0), score: Number(s.score||0), maxCombo: Number(s.maxCombo||0),
     counts: s.counts||{}, accuracy: Number(s.accuracy||0), rank: String(s.rank||'F'), pp: Number(s.pp||0),
-    mods: String(s.mods||''), passed: !!s.passed, replay: s.replay||null, createdAt: Date.now()
+    mods: String(s.mods||''), passed: !!s.passed, replay: s.replay||null, verified: true, createdAt: Date.now()
   };
   db.scores.push(score);
   // update profile stats
@@ -193,6 +228,12 @@ app.post('/api/scores', (req, res) => {
 app.get('/api/scores/user/:id', (req, res) => {
   const scores = db.scores.filter(s=>s.userId===Number(req.params.id)).sort((a,b)=>b.createdAt-a.createdAt).slice(0,100);
   res.json({ scores });
+});
+app.get('/api/scores/:id/replay', (req, res) => {
+  const s = db.scores.find(x=>x.id===Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'Score not found' });
+  if (!s.replay) return res.status(404).json({ error: 'No replay for this score' });
+  res.json({ replay: s.replay, meta: { mapId: s.mapId, mapTitle: s.mapTitle, mode: s.mode, score: s.score, accuracy: s.accuracy, rank: s.rank } });
 });
 
 // ---------- Friends ----------
@@ -262,6 +303,7 @@ function broadcastLobby(lobby, msg) {
 function lobbySnapshot(lobby) {
   return {
     id: lobby.id, name: lobby.name, hostId: lobby.hostId, mapId: lobby.mapId, mode: lobby.mode,
+    hasPassword: !!lobby.password, mods: lobby.mods || [],
     playerCount: lobby.players.size, readyCount: lobby.ready.size,
     players: [...lobby.players].map(ws => { const c = clients.get(ws); return c ? { userId: c.userId, username: c.username } : { userId: 0, username: 'Guest' }; }),
     ready: [...lobby.ready].map(ws => { const c = clients.get(ws); return c ? c.username : 'Guest'; }),
@@ -293,13 +335,14 @@ wss.on('connection', (ws, req) => {
       wss.clients.forEach(c => { if (c.readyState===WebSocket.OPEN) c.send(JSON.stringify(out)); });
     } else if (msg.type === 'lobby_create') {
       const id = nextLobbyId++;
-      const lobby = { id, name: String(msg.name||'Lobby').slice(0,60), hostId: me.userId, mapId: String(msg.mapId||'builtin-1'), mode: Number(msg.mode||0), players: new Set([ws]), ready: new Set(), started: false, scores: new Map() };
+      const lobby = { id, name: String(msg.name||'Lobby').slice(0,60), hostId: me.userId, mapId: String(msg.mapId||'builtin-1'), mode: Number(msg.mode||0), password: String(msg.password||'').slice(0,20), mods: Array.isArray(msg.mods)?msg.mods.slice(0,12):[], players: new Set([ws]), ready: new Set(), started: false, scores: new Map() };
       lobbies.set(id, lobby);
       ws.send(JSON.stringify({ type: 'lobby_joined', lobby: lobbySnapshot(lobby) }));
       sendLobbyList();
     } else if (msg.type === 'lobby_join') {
       const lobby = lobbies.get(Number(msg.lobbyId));
       if (!lobby) return ws.send(JSON.stringify({ type: 'error', error: 'Lobby not found' }));
+      if (lobby.password && String(msg.password||'') !== lobby.password) return ws.send(JSON.stringify({ type: 'error', error: 'Wrong password' }));
       lobby.players.add(ws);
       ws.send(JSON.stringify({ type: 'lobby_joined', lobby: lobbySnapshot(lobby) }));
       broadcastLobby(lobby, { type: 'lobby_update', lobby: lobbySnapshot(lobby) });
@@ -321,16 +364,23 @@ wss.on('connection', (ws, req) => {
     } else if (msg.type === 'lobby_start') {
       const lobby = lobbies.get(Number(msg.lobbyId));
       if (!lobby) return;
+      if (Array.isArray(msg.mods)) lobby.mods = msg.mods.slice(0,12);
       lobby.started = true;
-      broadcastLobby(lobby, { type: 'multi_start', lobbyId: lobby.id, mapId: lobby.mapId, mode: lobby.mode, startAt: Date.now()+3000 });
+      broadcastLobby(lobby, { type: 'multi_start', lobbyId: lobby.id, mapId: lobby.mapId, mode: lobby.mode, mods: lobby.mods, startAt: Date.now()+3000 });
       sendLobbyList();
     } else if (msg.type === 'multi_score') {
       const lobby = lobbies.get(Number(msg.lobbyId));
       if (!lobby) return;
       lobby.scores.set(ws, { score: Number(msg.score||0), combo: Number(msg.combo||0), acc: Number(msg.acc||0) });
       broadcastLobby(lobby, { type: 'multi_score_update', lobbyId: lobby.id, scores: [...lobby.scores.entries()].map(([w,s])=>({ username:(clients.get(w)||{}).username||'Guest', ...s })) });
+    } else if (msg.type === 'spectate_replay') {
+      // live replay streaming: relay replay event chunks to lobby (spectators watch)
+      const lobby = lobbies.get(Number(msg.lobbyId));
+      if (!lobby) return;
+      const events = Array.isArray(msg.events) ? msg.events.slice(-200) : [];
+      broadcastLobby(lobby, { type: 'spectate_replay_update', lobbyId: lobby.id, username: me.username, events, mapTime: Number(msg.mapTime||0) });
     } else if (msg.type === 'spectate') {
-      ws.send(JSON.stringify({ type: 'spectate_info', message: 'Spectator mode: live scores stream via multi_score_update. Join a lobby to spectate.' }));
+      ws.send(JSON.stringify({ type: 'spectate_info', message: 'Spectator mode: live scores + replay stream. Join a lobby to spectate.' }));
     } else if (msg.type === 'ping') {
       ws.send(JSON.stringify({ type: 'pong', time: Date.now() }));
     }
