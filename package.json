@@ -1,0 +1,19 @@
+{
+  "name": "osu-web",
+  "version": "1.0.0",
+  "description": "Browser recreation of osu! — all 4 rulesets, beatmap import, replays, multiplayer, leaderboards",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.17.0",
+    "jszip": "^3.10.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
